@@ -1,0 +1,813 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MUNCH!</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #1a1c2c;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  canvas {
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    box-shadow: 0 0 40px rgba(0,0,0,0.6);
+    max-width: 100vw;
+    max-height: 100vh;
+  }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="624"></canvas>
+<script>
+"use strict";
+
+// ============================================================ constants
+
+const TILE = 16;              // world pixels per tile
+const SCALE = 3;              // render scale
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const VIEW_W = canvas.width / SCALE;    // 320 world px (20 tiles)
+const VIEW_H = canvas.height / SCALE;   // 208 world px (13 tiles)
+
+// Velocities are scaled by k=0.65 and accelerations by k^2 relative to the
+// original tuning: motion is slower but the jump arc covers the same distance
+// (~4.7 tiles long, ~2.9 tiles high), so all level pits stay clearable.
+const GRAVITY   = 0.144;
+const MAX_FALL  = 4.5;
+const ACCEL     = 0.13;
+const AIR_ACCEL = 0.09;
+const FRICTION  = 0.15;
+const MAX_VX    = 1.5;
+const JUMP_V    = 3.65;
+const JUMP_CUT  = 0.45;   // multiplier applied to vy when jump is released early
+const COYOTE    = 10;     // frames of jump grace after walking off a ledge
+const BUFFER    = 10;     // frames a jump press is remembered before landing
+
+const FOOD_INFO = {
+  a: { name: "apple",     points: 50  },
+  c: { name: "cherry",    points: 75  },
+  d: { name: "donut",     points: 100 },
+  p: { name: "pizza",     points: 150 },
+  t: { name: "drumstick", points: 200 },
+};
+
+// ============================================================ pixel sprites
+
+function makeSprite(rows, palette, px = 1) {
+  const w = rows[0].length, h = rows.length;
+  const cv = document.createElement("canvas");
+  cv.width = w * px; cv.height = h * px;
+  const c = cv.getContext("2d");
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const col = palette[rows[y][x]];
+      if (!col) continue;
+      c.fillStyle = col;
+      c.fillRect(x * px, y * px, px, px);
+    }
+  }
+  return cv;
+}
+
+// Maitake (hen of the woods): a pom-pom of wavy gray-brown ruffles with cream
+// frill edges, overhanging a cream body. The cap is a separate layer so it can
+// flop, sway, and ripple independently of the body.
+const MUSHROOM_PALETTE =
+  { o:"#4a3a28", B:"#8d7660", b:"#6b5a44", T:"#e0d0ac",
+    C:"#f2e8d0", W:"#ffffff", K:"#222233", P:"#dfa08f", m:"#6b5340" };
+
+const bodySprite = makeSprite([
+  "..oCCCCCCCCo..",
+  "..oCCCCCCCCo..",
+  "..oCWWCCWWCo..",
+  "..oCWKCCWKCo..",
+  "..oPCCmmCCPo..",
+  "..oCCCCCCCCo..",
+  "...oooooooo...",
+], MUSHROOM_PALETTE);
+
+// two ruffle frames; alternating them makes the frills ripple
+const capSpriteA = makeSprite([
+  "...oo..oo.....",
+  "..oBBooBBoo...",
+  ".oBTTBBBTTBo..",
+  ".oBBTTBoBTTBo.",
+  "oBTTBBBTTBBTBo",
+  "oBBoTTBBoTTBBo",
+  ".obTTbbTTbbTo.",
+], MUSHROOM_PALETTE);
+const capSpriteB = makeSprite([
+  "...oo..oo.....",
+  "..oBBooBBoo...",
+  ".oBBTTBBBTTo..",
+  ".oBTTBBoTTBBo.",
+  "oBBTTBBBTTBBTo",
+  "oBBoBTTBoBTTBo",
+  ".obbTTbbTTbTo.",
+], MUSHROOM_PALETTE);
+
+const foodSprites = {
+  a: makeSprite([
+    "....G...",
+    "...G....",
+    "..RRRR..",
+    ".RWRRRR.",
+    ".RRRRRR.",
+    ".RRRRRR.",
+    "..RRRR..",
+    "........",
+  ], { G:"#4a9c2d", R:"#e23d3d", W:"#ff9d9d" }),
+  c: makeSprite([
+    "....G...",
+    "...G....",
+    "..G.G...",
+    ".RR..RR.",
+    ".RW..RW.",
+    ".RR..RR.",
+    "........",
+    "........",
+  ], { G:"#4a9c2d", R:"#c92454", W:"#ff8fb0" }),
+  d: makeSprite([
+    "..PPPP..",
+    ".PSPPSP.",
+    ".PP..PP.",
+    ".OO..OO.",
+    "..OOOO..",
+    "........",
+    "........",
+    "........",
+  ], { P:"#f27bb4", S:"#fff3a0", O:"#c98a3d" }),
+  p: makeSprite([
+    ".CCCCCC.",
+    ".YYYYYY.",
+    ".YRYYRY.",
+    "..YYYY..",
+    "..YRYY..",
+    "...YY...",
+    "...Y....",
+    "........",
+  ], { C:"#c98a3d", Y:"#f7d148", R:"#d43a3a" }),
+  t: makeSprite([
+    "..MMMM..",
+    ".MMMMMM.",
+    ".MMMMMM.",
+    "..MMMM..",
+    "....W...",
+    "...WW...",
+    "...WW...",
+    "........",
+  ], { M:"#b5722f", W:"#f2ead9" }),
+};
+
+const heartSprite = makeSprite([
+  ".RR.RR.",
+  "RRRRRRR",
+  "RWRRRRR",
+  ".RRRRR.",
+  "..RRR..",
+  "...R...",
+], { R:"#e23d3d", W:"#ff9d9d" });
+
+// ground / platform tiles, generated once
+function makeTile(kind) {
+  const cv = document.createElement("canvas");
+  cv.width = TILE; cv.height = TILE;
+  const c = cv.getContext("2d");
+  if (kind === "grass" || kind === "dirt") {
+    c.fillStyle = "#8a5a2b";
+    c.fillRect(0, 0, TILE, TILE);
+    // deterministic speckles
+    c.fillStyle = "#734a22";
+    for (let i = 0; i < 10; i++) {
+      c.fillRect((i * 7 + 3) % TILE, (i * 5 + (kind === "grass" ? 7 : 2)) % TILE, 2, 2);
+    }
+    if (kind === "grass") {
+      c.fillStyle = "#4fbf3f";
+      c.fillRect(0, 0, TILE, 4);
+      c.fillStyle = "#3a9c2e";
+      for (let x = 0; x < TILE; x += 4) c.fillRect(x + (x % 8 ? 1 : 2), 3, 2, 2);
+    }
+  } else { // platform
+    c.fillStyle = "#b07840";
+    c.fillRect(0, 0, TILE, TILE);
+    c.fillStyle = "#8a5a2b";
+    c.fillRect(0, TILE - 3, TILE, 3);
+    c.fillStyle = "#d9a05f";
+    c.fillRect(0, 0, TILE, 2);
+    c.fillStyle = "#96622f";
+    c.fillRect(7, 4, 2, TILE - 8);
+  }
+  return cv;
+}
+const tileGrass = makeTile("grass");
+const tileDirt  = makeTile("dirt");
+const tilePlat  = makeTile("plat");
+
+// ============================================================ levels
+//
+// Map legend:  # solid ground   = platform   S start   F flag (exit)
+// Food:        a apple(50)  c cherry(75)  d donut(100)  p pizza(150)  t drumstick(200)
+// Rows shorter than the level width are padded with empty space.
+// Pits are gaps in the bottom rows — fall in and lose a life!
+
+// LEVELS-START
+const LEVELS = [
+{
+  name: "Green Meadow",
+  //        1         2         3         4         5         6         7         8         9
+  //2345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901
+  map: [
+"",
+"",
+"",
+"",
+"",
+"",
+"                                               dd                                  t",
+"                                              ====                                ====",
+"                         cc                          d       cc",
+"                        ====            ====                ====            ====",
+"   S  a a                     aa                          a        aa                     a   F",
+"##################  ##############   ###############   ###############   ##############################",
+"##################  ##############   ###############   ###############   ##############################",
+  ],
+},
+{
+  name: "Rolling Hills",
+  //        1         2         3         4         5         6         7         8         9         10
+  //23456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678
+  map: [
+"",
+"",
+"",
+"",
+"",
+"",
+"                                                                 t",
+"                                    p                           ===",
+"                           d        ##         c    d",
+"               c                  ####        ===  ===      ===                      c           c",
+"  S  a a a                      ######                                    aaa              a a           F",
+"##############   #########    ##############             ###########    ############   #########   ###########",
+"##############   #########    ##############             ###########    ############   #########   ###########",
+  ],
+},
+{
+  name: "Sky Snack Run",
+  //        1         2         3         4         5         6         7         8         9         10        11
+  //234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678
+  map: [
+"",
+"",
+"",
+"",
+"",
+"",
+"                                                            p                                                   t",
+"                                           d               ===                                                 ===",
+"                         dd            c  ==   c                                           dd",
+"             cc                       ==      ==  ==   ===     cc     ##     cc                          c  ==",
+"  S a a a                                             aa              ## aa         a a a                           F",
+"############    ########    ########                 #########    ##########    ##########    ##########   #############",
+"############    ########    ########                 #########    ##########    ##########    ##########   #############",
+  ],
+},
+];
+// LEVELS-END
+
+// ============================================================ level parsing
+
+let level = null; // { tiles, w, h, foods, startX, startY, flagX, flagY, name, totalFood }
+
+function loadLevel(index) {
+  const src = LEVELS[index];
+  const h = src.map.length;
+  const w = Math.max(...src.map.map(r => r.length));
+  const tiles = [];
+  const foods = [];
+  let startX = TILE, startY = 0, flagX = 0, flagY = 0;
+  for (let y = 0; y < h; y++) {
+    tiles.push(new Uint8Array(w));
+    const row = src.map[y];
+    for (let x = 0; x < w; x++) {
+      const ch = x < row.length ? row[x] : " ";
+      if (ch === "#") tiles[y][x] = 1;
+      else if (ch === "=") tiles[y][x] = 2;
+      else if (ch === "S") { startX = x * TILE + 3; startY = y * TILE + 6; }
+      else if (ch === "F") { flagX = x * TILE; flagY = y * TILE; }
+      else if (FOOD_INFO[ch]) foods.push({ type: ch, x: x * TILE + 4, y: y * TILE + 4, taken: false });
+    }
+  }
+  level = { tiles, w, h, foods, startX, startY, flagX, flagY,
+            name: src.name, totalFood: foods.length };
+}
+
+function solidAt(tx, ty) {
+  if (tx < 0 || tx >= level.w) return true;         // level edges are walls
+  if (ty < 0 || ty >= level.h) return false;        // open sky above, open pit below
+  return level.tiles[ty][tx] > 0;
+}
+
+// ============================================================ audio
+
+let audioCtx = null;
+function ensureAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === "suspended") audioCtx.resume();
+}
+function tone(freq, endFreq, dur, type, vol, when = 0) {
+  if (!audioCtx) return;
+  const t0 = audioCtx.currentTime + when;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, t0);
+  osc.frequency.exponentialRampToValueAtTime(Math.max(endFreq, 1), t0 + dur);
+  gain.gain.setValueAtTime(vol, t0);
+  gain.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start(t0);
+  osc.stop(t0 + dur);
+}
+const sfx = {
+  jump:    () => tone(240, 520, 0.16, "square",   0.12),
+  collect: () => tone(880, 1400, 0.12, "sine",    0.16),
+  death:   () => tone(320, 55,  0.55, "sawtooth", 0.16),
+  clear:   () => { tone(523, 523, 0.12, "square", 0.12);
+                   tone(659, 659, 0.12, "square", 0.12, 0.12);
+                   tone(784, 784, 0.22, "square", 0.12, 0.24); },
+  gameover:() => { tone(392, 392, 0.2, "square", 0.12);
+                   tone(311, 311, 0.2, "square", 0.12, 0.2);
+                   tone(233, 233, 0.4, "square", 0.12, 0.4); },
+};
+
+// ============================================================ input
+
+const keys = {};
+window.addEventListener("keydown", (e) => {
+  if (["ArrowLeft","ArrowRight","ArrowUp","ArrowDown"," "].includes(e.key)) e.preventDefault();
+  ensureAudio();
+  if (!keys[e.code]) keyPressed(e.code);
+  keys[e.code] = true;
+});
+window.addEventListener("keyup", (e) => { keys[e.code] = false; });
+
+const left  = () => keys.ArrowLeft  || keys.KeyA;
+const right = () => keys.ArrowRight || keys.KeyD;
+const jumpHeld = () => keys.Space || keys.ArrowUp || keys.KeyW;
+
+// ============================================================ game state
+
+const game = {
+  state: "title",       // title | play | dead | clear | gameover | win
+  levelIndex: 0,
+  score: 0,
+  levelStartScore: 0,
+  lives: 3,
+  foodEaten: 0,
+  timer: 0,
+  frame: 0,
+  best: Number(localStorage.getItem("munch-best") || 0),
+};
+
+const player = {
+  x: 0, y: 0, w: 10, h: 10,
+  vx: 0, vy: 0,
+  onGround: false, coyote: 0, jumpBuf: 0,
+  face: 1, squashX: 1, squashY: 1,
+  capDy: 0, capVy: 0,   // floppy-cap spring: vertical lag of the ruffle cap
+};
+
+let camX = 0;
+let particles = [];  // { x, y, vx, vy, life, color }
+let popups = [];     // { x, y, text, life }
+
+function startLevel(index) {
+  game.levelIndex = index;
+  game.levelStartScore = game.score;
+  game.foodEaten = 0;
+  loadLevel(index);
+  player.x = level.startX; player.y = level.startY;
+  player.vx = 0; player.vy = 0;
+  player.onGround = false; player.coyote = 0; player.jumpBuf = 0;
+  player.face = 1; player.squashX = 1; player.squashY = 1;
+  player.capDy = 0; player.capVy = 0;
+  camX = Math.max(0, player.x - VIEW_W / 3);
+  particles = []; popups = [];
+  game.state = "play";
+}
+
+function newGame() {
+  game.score = 0;
+  game.lives = 3;
+  startLevel(0);
+}
+
+function keyPressed(code) {
+  if (code === "Space" || code === "ArrowUp" || code === "KeyW") {
+    if (game.state === "play") player.jumpBuf = BUFFER;
+  }
+  if (code === "Enter" || code === "Space") {
+    if (game.state === "title" || game.state === "gameover" || game.state === "win") newGame();
+  }
+  if (code === "KeyR" && game.state === "play") {
+    game.score = game.levelStartScore;
+    startLevel(game.levelIndex);
+  }
+}
+
+// ============================================================ update
+
+function update() {
+  game.frame++;
+  if (game.state === "play") updatePlay();
+  else if (game.state === "dead" || game.state === "clear") {
+    if (--game.timer <= 0) {
+      if (game.state === "dead") {
+        if (game.lives > 0) { game.score = game.levelStartScore; startLevel(game.levelIndex); }
+        else { game.state = "gameover"; sfx.gameover(); }
+      } else {
+        if (game.levelIndex + 1 < LEVELS.length) startLevel(game.levelIndex + 1);
+        else {
+          game.state = "win";
+          if (game.score > game.best) {
+            game.best = game.score;
+            localStorage.setItem("munch-best", String(game.best));
+          }
+        }
+      }
+    }
+    updateEffects();
+  }
+}
+
+function updatePlay() {
+  const prevVy = player.vy;
+
+  // horizontal movement
+  const acc = player.onGround ? ACCEL : AIR_ACCEL;
+  if (left() && !right())      { player.vx -= acc; player.face = -1; }
+  else if (right() && !left()) { player.vx += acc; player.face = 1; }
+  else if (player.onGround) {
+    if (player.vx > 0) player.vx = Math.max(0, player.vx - FRICTION);
+    else               player.vx = Math.min(0, player.vx + FRICTION);
+  }
+  player.vx = Math.max(-MAX_VX, Math.min(MAX_VX, player.vx));
+
+  // jumping: coyote time + jump buffering + variable height
+  if (player.onGround) player.coyote = COYOTE;
+  else if (player.coyote > 0) player.coyote--;
+  if (player.jumpBuf > 0) player.jumpBuf--;
+
+  if (player.jumpBuf > 0 && player.coyote > 0) {
+    player.vy = -JUMP_V;
+    player.coyote = 0; player.jumpBuf = 0;
+    player.squashX = 0.7; player.squashY = 1.35;
+    sfx.jump();
+  }
+  if (!jumpHeld() && player.vy < 0) player.vy *= JUMP_CUT;
+
+  player.vy = Math.min(player.vy + GRAVITY, MAX_FALL);
+
+  moveAndCollide();
+
+  // squash/stretch springs back to normal
+  player.squashX += (1 - player.squashX) * 0.2;
+  player.squashY += (1 - player.squashY) * 0.2;
+
+  // floppy cap: any sudden change in the body's vertical speed (jump launch,
+  // landing) throws the cap the other way, and a damped spring pulls it home
+  player.capVy -= (player.vy - prevVy) * 0.55;
+  player.capVy += -0.3 * player.capDy;
+  player.capVy *= 0.75;
+  player.capDy = Math.max(-2, Math.min(2.5, player.capDy + player.capVy));
+
+  // food
+  for (const f of level.foods) {
+    if (f.taken) continue;
+    const bob = Math.sin(game.frame / 20 + f.x / 13) * 2;
+    if (player.x < f.x + 8 && player.x + player.w > f.x &&
+        player.y < f.y + bob + 8 && player.y + player.h > f.y + bob) {
+      f.taken = true;
+      game.foodEaten++;
+      const pts = FOOD_INFO[f.type].points;
+      game.score += pts;
+      popups.push({ x: f.x + 4, y: f.y - 4, text: "+" + pts, life: 45 });
+      for (let i = 0; i < 8; i++) {
+        particles.push({
+          x: f.x + 4, y: f.y + 4,
+          vx: (Math.random() - 0.5) * 2.4, vy: -Math.random() * 2.2 - 0.4,
+          life: 25 + Math.random() * 15, color: "#ffe97a",
+        });
+      }
+      sfx.collect();
+    }
+  }
+
+  // flag
+  if (player.x + player.w > level.flagX + 4 && player.x < level.flagX + TILE &&
+      player.y + player.h > level.flagY - TILE) {
+    game.score += 500;
+    popups.push({ x: level.flagX + 8, y: level.flagY - 12, text: "+500", life: 60 });
+    game.state = "clear";
+    game.timer = 130;
+    sfx.clear();
+  }
+
+  // fell into a pit
+  if (player.y > level.h * TILE + 24) {
+    game.lives--;
+    game.state = "dead";
+    game.timer = 70;
+    sfx.death();
+  }
+
+  // camera follows with a little lookahead
+  const target = player.x - VIEW_W / 2 + player.face * 30;
+  camX += (target - camX) * 0.08;
+  camX = Math.max(0, Math.min(camX, level.w * TILE - VIEW_W));
+
+  updateEffects();
+}
+
+function updateEffects() {
+  for (const p of particles) {
+    p.x += p.vx; p.y += p.vy; p.vy += 0.12; p.life--;
+  }
+  particles = particles.filter(p => p.life > 0);
+  for (const p of popups) { p.y -= 0.5; p.life--; }
+  popups = popups.filter(p => p.life > 0);
+}
+
+// axis-separated AABB collision against the tilemap
+function moveAndCollide() {
+  // horizontal
+  player.x += player.vx;
+  let x0 = Math.floor(player.x / TILE), x1 = Math.floor((player.x + player.w - 0.01) / TILE);
+  let y0 = Math.floor(player.y / TILE), y1 = Math.floor((player.y + player.h - 0.01) / TILE);
+  for (let ty = y0; ty <= y1; ty++) {
+    for (let tx = x0; tx <= x1; tx++) {
+      if (!solidAt(tx, ty)) continue;
+      if (player.vx > 0) player.x = tx * TILE - player.w;
+      else if (player.vx < 0) player.x = (tx + 1) * TILE;
+      player.vx = 0;
+    }
+  }
+  // vertical
+  player.y += player.vy;
+  player.onGround = false;
+  x0 = Math.floor(player.x / TILE); x1 = Math.floor((player.x + player.w - 0.01) / TILE);
+  y0 = Math.floor(player.y / TILE); y1 = Math.floor((player.y + player.h - 0.01) / TILE);
+  for (let ty = y0; ty <= y1; ty++) {
+    for (let tx = x0; tx <= x1; tx++) {
+      if (!solidAt(tx, ty)) continue;
+      if (player.vy > 0) {
+        player.y = ty * TILE - player.h;
+        if (player.vy > 2.3) { player.squashX = 1.3; player.squashY = 0.7; } // landing thump
+        player.vy = 0;
+        player.onGround = true;
+      } else if (player.vy < 0) {
+        player.y = (ty + 1) * TILE;
+        player.vy = 0;
+      }
+    }
+  }
+}
+
+// ============================================================ render
+
+function render() {
+  ctx.save();
+  ctx.imageSmoothingEnabled = false;
+  ctx.scale(SCALE, SCALE);
+
+  drawBackground();
+
+  if (game.state === "title") { drawTitle(); ctx.restore(); return; }
+
+  ctx.save();
+  ctx.translate(-Math.round(camX), 0);
+  drawTiles();
+  drawFlag();
+  drawFoods();
+  drawPlayer();
+  for (const p of particles) {
+    ctx.fillStyle = p.color;
+    ctx.globalAlpha = Math.min(1, p.life / 15);
+    ctx.fillRect(p.x, p.y, 2, 2);
+    ctx.globalAlpha = 1;
+  }
+  ctx.font = "bold 7px monospace";
+  ctx.textAlign = "center";
+  for (const p of popups) {
+    ctx.fillStyle = "#1a1c2c";
+    ctx.fillText(p.text, p.x + 1, p.y + 1);
+    ctx.fillStyle = "#ffe97a";
+    ctx.fillText(p.text, p.x, p.y);
+  }
+  ctx.restore();
+
+  drawHUD();
+  if (game.state === "clear")    drawBanner("LEVEL CLEAR!", "#8fe97a");
+  if (game.state === "gameover") drawEndScreen("GAME OVER", "#ff7a7a");
+  if (game.state === "win")      drawEndScreen("YOU WIN!", "#ffe97a");
+  ctx.restore();
+}
+
+function drawBackground() {
+  const grad = ctx.createLinearGradient(0, 0, 0, VIEW_H);
+  grad.addColorStop(0, "#7ec8f0");
+  grad.addColorStop(1, "#cfeef8");
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+  // clouds (slow parallax)
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  const cx = camX * 0.2;
+  for (let i = 0; i < 6; i++) {
+    const x = ((i * 137 - cx) % (VIEW_W + 60) + VIEW_W + 60) % (VIEW_W + 60) - 30;
+    const y = 18 + (i * 31) % 55;
+    ctx.fillRect(x, y, 34, 8);
+    ctx.fillRect(x + 6, y - 5, 20, 6);
+  }
+  // far hills (kept pastel so the green player always stands out)
+  drawHills(camX * 0.35, "#bce0c4", 46, 90);
+  // near hills
+  drawHills(camX * 0.6, "#9ed4a8", 30, 60);
+}
+
+function drawHills(scroll, color, height, wavelength) {
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(0, VIEW_H);
+  for (let x = 0; x <= VIEW_W; x += 4) {
+    const wx = x + scroll;
+    const y = VIEW_H - height - Math.sin(wx / wavelength) * height * 0.55
+                              - Math.sin(wx / (wavelength * 0.37)) * height * 0.18;
+    ctx.lineTo(x, y);
+  }
+  ctx.lineTo(VIEW_W, VIEW_H);
+  ctx.fill();
+}
+
+function drawTiles() {
+  const tx0 = Math.max(0, Math.floor(camX / TILE));
+  const tx1 = Math.min(level.w - 1, Math.ceil((camX + VIEW_W) / TILE));
+  for (let ty = 0; ty < level.h; ty++) {
+    for (let tx = tx0; tx <= tx1; tx++) {
+      const t = level.tiles[ty][tx];
+      if (t === 1) {
+        const grassy = !(ty > 0 && level.tiles[ty - 1][tx] === 1);
+        ctx.drawImage(grassy ? tileGrass : tileDirt, tx * TILE, ty * TILE);
+      } else if (t === 2) {
+        ctx.drawImage(tilePlat, tx * TILE, ty * TILE);
+      }
+    }
+  }
+}
+
+function drawFlag() {
+  const x = level.flagX + 6, top = level.flagY - TILE;
+  ctx.fillStyle = "#8899aa";
+  ctx.fillRect(x, top, 2, TILE * 2);
+  ctx.fillStyle = "#667788";
+  ctx.fillRect(x - 2, level.flagY + TILE - 3, 6, 3);
+  const wave = Math.sin(game.frame / 10) * 1.5;
+  ctx.fillStyle = "#e23d3d";
+  ctx.beginPath();
+  ctx.moveTo(x + 2, top);
+  ctx.lineTo(x + 14, top + 4 + wave);
+  ctx.lineTo(x + 2, top + 9);
+  ctx.fill();
+}
+
+function drawFoods() {
+  for (const f of level.foods) {
+    if (f.taken) continue;
+    const bob = Math.sin(game.frame / 20 + f.x / 13) * 2;
+    ctx.drawImage(foodSprites[f.type], Math.round(f.x), Math.round(f.y + bob));
+  }
+}
+
+function drawPlayer() {
+  const moving = Math.abs(player.vx) > 0.3;
+  let bounce = 1;
+  if (player.onGround && moving) {
+    bounce = 1 + Math.sin(game.frame / 5) * 0.06;  // running jiggle
+  }
+  const sx = player.squashX / bounce;
+  const sy = player.squashY * bounce;
+  ctx.save();
+  // anchor at bottom-center so squash/stretch keeps the feet planted
+  ctx.translate(Math.round(player.x + player.w / 2), Math.round(player.y + player.h));
+  ctx.scale(player.face * sx, sy);
+  ctx.drawImage(bodySprite, -7, -7);
+  // ruffle cap: sheared around the feet so the frills swing while running
+  // (gentle drift when idle), rippling between two frames, riding its spring
+  const shear = player.onGround && moving
+    ? Math.sin(game.frame / 5) * 0.22
+    : Math.sin(game.frame / 45) * 0.08;
+  ctx.transform(1, 0, -shear, 1, 0, 0);
+  const rippling = moving || !player.onGround;
+  const cap = rippling && Math.floor(game.frame / 8) % 2 ? capSpriteB : capSpriteA;
+  ctx.drawImage(cap, -7, -12 + Math.round(player.capDy));
+  ctx.restore();
+}
+
+function drawHUD() {
+  ctx.fillStyle = "rgba(26,28,44,0.55)";
+  ctx.fillRect(0, 0, VIEW_W, 15);
+  for (let i = 0; i < 3; i++) {
+    ctx.globalAlpha = i < game.lives ? 1 : 0.25;
+    ctx.drawImage(heartSprite, 4 + i * 9, 4);
+  }
+  ctx.globalAlpha = 1;
+  ctx.font = "bold 8px monospace";
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText("SCORE " + game.score, 36, 11);
+  ctx.textAlign = "center";
+  ctx.fillText(level.name.toUpperCase(), VIEW_W / 2 + 20, 11);
+  ctx.textAlign = "right";
+  ctx.fillText("FOOD " + game.foodEaten + "/" + level.totalFood +
+               "  LV " + (game.levelIndex + 1) + "/" + LEVELS.length, VIEW_W - 4, 11);
+}
+
+function drawTitle() {
+  ctx.fillStyle = "rgba(26,28,44,0.35)";
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+  // big bobbing mushroom mascot; the cap bobs a beat behind the body
+  const bob = Math.sin(game.frame / 25) * 4;
+  const capLag = Math.round(Math.sin(game.frame / 25 - 1.1) * 1.5);
+  ctx.save();
+  ctx.translate(VIEW_W / 2, 118 + bob);
+  ctx.scale(4, 4);
+  ctx.drawImage(bodySprite, -7, -7);
+  ctx.transform(1, 0, -Math.sin(game.frame / 45) * 0.08, 1, 0, 0);
+  ctx.drawImage(Math.floor(game.frame / 20) % 2 ? capSpriteB : capSpriteA,
+                -7, -12 + capLag);
+  ctx.restore();
+
+  ctx.textAlign = "center";
+  ctx.font = "bold 30px monospace";
+  ctx.fillStyle = "#1a1c2c";
+  ctx.fillText("MUNCH!", VIEW_W / 2 + 2, 52);
+  ctx.fillStyle = "#ffe97a";
+  ctx.fillText("MUNCH!", VIEW_W / 2, 50);
+
+  ctx.font = "bold 8px monospace";
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText("Eat everything. Don't fall in the pits.", VIEW_W / 2, 140);
+  ctx.fillText("ARROWS / WASD move   ·   SPACE jump", VIEW_W / 2, 156);
+  if (game.best > 0) ctx.fillText("BEST SCORE: " + game.best, VIEW_W / 2, 172);
+  if (Math.floor(game.frame / 30) % 2 === 0) {
+    ctx.fillStyle = "#ffe97a";
+    ctx.fillText("- PRESS ENTER TO START -", VIEW_W / 2, 190);
+  }
+}
+
+function drawBanner(text, color) {
+  ctx.fillStyle = "rgba(26,28,44,0.6)";
+  ctx.fillRect(0, VIEW_H / 2 - 22, VIEW_W, 44);
+  ctx.textAlign = "center";
+  ctx.font = "bold 18px monospace";
+  ctx.fillStyle = color;
+  ctx.fillText(text, VIEW_W / 2, VIEW_H / 2 + 6);
+}
+
+function drawEndScreen(text, color) {
+  ctx.fillStyle = "rgba(26,28,44,0.75)";
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  ctx.textAlign = "center";
+  ctx.font = "bold 24px monospace";
+  ctx.fillStyle = color;
+  ctx.fillText(text, VIEW_W / 2, 80);
+  ctx.font = "bold 9px monospace";
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText("SCORE: " + game.score, VIEW_W / 2, 106);
+  if (game.best > 0) ctx.fillText("BEST: " + game.best, VIEW_W / 2, 122);
+  if (Math.floor(game.frame / 30) % 2 === 0) {
+    ctx.fillStyle = "#ffe97a";
+    ctx.fillText("- PRESS ENTER TO PLAY AGAIN -", VIEW_W / 2, 156);
+  }
+}
+
+// ============================================================ main loop
+
+function frame() {
+  update();
+  render();
+  requestAnimationFrame(frame);
+}
+loadLevel(0); // so the title screen has a level behind it if needed
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
